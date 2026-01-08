@@ -29,9 +29,28 @@ set_no_color() {
     fi
 }
 
+# 检测操作系统
+detect_os() {
+    case "$(uname -s)" in
+        Darwin*)
+            echo "macos"
+            ;;
+        Linux*)
+            echo "linux"
+            ;;
+        *)
+            echo "unknown"
+            ;;
+    esac
+}
+
+OS_TYPE=$(detect_os)
+
 # 配置文件路径
 CONFIG_FILE="$HOME/.ccm_config"
 ACCOUNTS_FILE="$HOME/.ccm_accounts"
+CLAUDE_CREDENTIALS_FILE="$HOME/.claude/.credentials.json"
+
 # Keychain service name (override with CCM_KEYCHAIN_SERVICE)
 KEYCHAIN_SERVICE="${CCM_KEYCHAIN_SERVICE:-Claude Code-credentials}"
 
@@ -341,8 +360,56 @@ mask_presence() {
 # Claude Pro 账号管理功能
 # ============================================
 
+# 跨平台 base64 编码函数（无换行）
+base64_encode_nolinebreak() {
+    if [[ "$OS_TYPE" == "macos" ]]; then
+        base64
+    else
+        base64 -w 0
+    fi
+}
+
+# 跨平台 base64 解码函数
+base64_decode() {
+    if [[ "$OS_TYPE" == "macos" ]]; then
+        base64 -d
+    else
+        base64 -d
+    fi
+}
+
+# 从 Linux 文件系统读取 Claude Code 凭证
+read_linux_credentials() {
+    if [[ ! -f "$CLAUDE_CREDENTIALS_FILE" ]]; then
+        echo ""
+        return 1
+    fi
+
+    # 优先使用 jq 提取 claudeAiOauth 对象
+    local credentials
+    if command -v jq >/dev/null 2>&1; then
+        credentials=$(jq -c '.claudeAiOauth' "$CLAUDE_CREDENTIALS_FILE" 2>/dev/null)
+    else
+        # 降级方案：使用 Python 或 grep（适用于简单情况）
+        if command -v python3 >/dev/null 2>&1; then
+            credentials=$(python3 -c "import json; f=open('$CLAUDE_CREDENTIALS_FILE'); d=json.load(f); print(json.dumps(d.get('claudeAiOauth', {})))" 2>/dev/null)
+        else
+            # 最后降级：简单的 grep（可能不完整）
+            credentials=$(cat "$CLAUDE_CREDENTIALS_FILE" | grep -o '"claudeAiOauth":{[^}]*}' | sed 's/"claudeAiOauth"://')
+        fi
+    fi
+
+    if [[ -z "$credentials" || "$credentials" == "null" ]]; then
+        echo ""
+        return 1
+    fi
+
+    echo "$credentials"
+    return 0
+}
+
 # 从 macOS Keychain 读取 Claude Code 凭证
-read_keychain_credentials() {
+read_macos_credentials() {
     local credentials
     local -a services=(
         "$KEYCHAIN_SERVICE"
@@ -363,8 +430,73 @@ read_keychain_credentials() {
     return 1
 }
 
+# 跨平台凭证读取函数
+read_keychain_credentials() {
+    case "$OS_TYPE" in
+        macos)
+            read_macos_credentials
+            ;;
+        linux)
+            read_linux_credentials
+            ;;
+        *)
+            echo -e "${RED}❌ Unsupported OS: $OS_TYPE${NC}" >&2
+            return 1
+            ;;
+    esac
+}
+
+# 写入凭证到 Linux 文件系统
+write_linux_credentials() {
+    local credentials="$1"
+
+    # 确保 .claude 目录存在
+    mkdir -p "$(dirname "$CLAUDE_CREDENTIALS_FILE")"
+
+    # 使用 jq 进行更可靠的 JSON 操作
+    if command -v jq >/dev/null 2>&1; then
+        if [[ -f "$CLAUDE_CREDENTIALS_FILE" ]]; then
+            # 更新现有文件，保留其他字段
+            jq --argjson oauth "$credentials" '.claudeAiOauth = $oauth' "$CLAUDE_CREDENTIALS_FILE" > "${CLAUDE_CREDENTIALS_FILE}.tmp"
+            mv "${CLAUDE_CREDENTIALS_FILE}.tmp" "$CLAUDE_CREDENTIALS_FILE"
+        else
+            # 创建新文件
+            echo "{\"claudeAiOauth\":$credentials}" | jq '.' > "$CLAUDE_CREDENTIALS_FILE"
+        fi
+    else
+        # 降级方案：使用纯 Bash（可能不完美，但可用）
+        local existing_content=""
+        local mcp_oauth=""
+
+        if [[ -f "$CLAUDE_CREDENTIALS_FILE" ]]; then
+            existing_content=$(cat "$CLAUDE_CREDENTIALS_FILE")
+            # 提取 mcpOAuth 部分（如果存在）- 更好的正则表达式
+            if command -v python3 >/dev/null 2>&1; then
+                mcp_oauth=$(python3 -c "import json; f=open('$CLAUDE_CREDENTIALS_FILE'); d=json.load(f); print(json.dumps(d.get('mcpOAuth', {})) if d.get('mcpOAuth') else '')" 2>/dev/null)
+            fi
+        fi
+
+        # 构建新的 JSON 文件
+        if [[ -n "$mcp_oauth" && "$mcp_oauth" != "{}" ]]; then
+            # 保留 mcpOAuth
+            cat > "$CLAUDE_CREDENTIALS_FILE" << EOF
+{"claudeAiOauth":$credentials,"mcpOAuth":$mcp_oauth}
+EOF
+        else
+            # 只有 claudeAiOauth
+            cat > "$CLAUDE_CREDENTIALS_FILE" << EOF
+{"claudeAiOauth":$credentials}
+EOF
+        fi
+    fi
+
+    chmod 600 "$CLAUDE_CREDENTIALS_FILE"
+    echo -e "${BLUE}🔑 $(t 'credentials_written_to_file')${NC}" >&2
+    return 0
+}
+
 # 写入凭证到 macOS Keychain
-write_keychain_credentials() {
+write_macos_credentials() {
     local credentials="$1"
     local username="$USER"
 
@@ -384,13 +516,41 @@ write_keychain_credentials() {
     return $result
 }
 
+# 跨平台凭证写入函数
+write_keychain_credentials() {
+    local credentials="$1"
+
+    case "$OS_TYPE" in
+        macos)
+            write_macos_credentials "$credentials"
+            ;;
+        linux)
+            write_linux_credentials "$credentials"
+            ;;
+        *)
+            echo -e "${RED}❌ Unsupported OS: $OS_TYPE${NC}" >&2
+            return 1
+            ;;
+    esac
+}
+
 # 调试函数：验证 Keychain 中的凭证
 debug_keychain_credentials() {
-    echo -e "${BLUE}🔍 调试：检查 Keychain 中的凭证${NC}"
+    # 根据操作系统显示不同标题
+    if [[ "$OS_TYPE" == "macos" ]]; then
+        echo -e "${BLUE}🔍 $(t 'credentials_source_keychain')${NC}"
+    else
+        echo -e "${BLUE}🔍 $(t 'credentials_source_file')${NC}"
+    fi
 
     local credentials=$(read_keychain_credentials)
     if [[ -z "$credentials" ]]; then
-        echo -e "${RED}❌ Keychain 中没有凭证${NC}"
+        if [[ "$OS_TYPE" == "macos" ]]; then
+            echo -e "${RED}❌ Keychain 中没有凭证${NC}"
+        else
+            echo -e "${RED}❌ $(t 'no_credentials_found')${NC}"
+            echo -e "${YELLOW}💡 $(t 'please_login_first')${NC}"
+        fi
         return 1
     fi
 
@@ -399,28 +559,32 @@ debug_keychain_credentials() {
     local expires=$(echo "$credentials" | grep -o '"expiresAt":[0-9]*' | cut -d':' -f2)
     local access_token_preview=$(echo "$credentials" | grep -o '"accessToken":"[^"]*"' | cut -d'"' -f4 | head -c 20)
 
-    echo -e "${GREEN}✅ 找到凭证：${NC}"
-    echo "   服务名: $KEYCHAIN_SERVICE"
-    echo "   订阅类型: ${subscription:-Unknown}"
+    echo -e "${GREEN}✅ $(t 'credentials_found')：${NC}"
+    if [[ "$OS_TYPE" == "macos" ]]; then
+        echo "   $(t 'service_name'): $KEYCHAIN_SERVICE"
+    else
+        echo "   $(t 'file_path'): $CLAUDE_CREDENTIALS_FILE"
+    fi
+    echo "   $(t 'subscription_type'): ${subscription:-Unknown}"
     if [[ -n "$expires" ]]; then
         local expires_str=$(date -r $((expires / 1000)) "+%Y-%m-%d %H:%M" 2>/dev/null || echo "Unknown")
-        echo "   过期时间: $expires_str"
+        echo "   $(t 'token_expires'): $expires_str"
     fi
-    echo "   Token 预览: ${access_token_preview}..."
+    echo "   $(t 'access_token'): ${access_token_preview}..."
 
     # 尝试匹配保存的账号
     if [[ -f "$ACCOUNTS_FILE" ]]; then
-        echo -e "${BLUE}🔍 尝试匹配保存的账号...${NC}"
+        echo -e "${BLUE}🔍 $(t 'trying_to_match_accounts')${NC}"
         while IFS=': ' read -r name encoded; do
             name=$(echo "$name" | tr -d '"')
             encoded=$(echo "$encoded" | tr -d '"')
-            local saved_creds=$(echo "$encoded" | base64 -d 2>/dev/null)
+            local saved_creds=$(echo "$encoded" | base64_decode 2>/dev/null)
             if [[ "$saved_creds" == "$credentials" ]]; then
-                echo -e "${GREEN}✅ 匹配到账号: $name${NC}"
+                echo -e "${GREEN}✅ $(t 'matched_account'): $name${NC}"
                 return 0
             fi
         done < <(grep --color=never -o '"[^"]*": *"[^"]*"' "$ACCOUNTS_FILE")
-        echo -e "${YELLOW}⚠️  没有匹配到任何保存的账号${NC}"
+        echo -e "${YELLOW}⚠️  $(t 'no_matching_account')${NC}"
     fi
 }
 
@@ -468,7 +632,7 @@ save_account() {
 
     # 简单的 JSON 更新：如果是空文件或只有 {}，直接写入
     if [[ "$existing_accounts" == "{}" || -z "$existing_accounts" ]]; then
-        local encoded_creds=$(echo "$credentials" | base64)
+        local encoded_creds=$(echo "$credentials" | base64_encode_nolinebreak)
         cat > "$ACCOUNTS_FILE" << EOF
 {
   "$account_name": "$encoded_creds"
@@ -479,12 +643,16 @@ EOF
         # 检查账号是否已存在
         if grep -q "\"$account_name\":" "$ACCOUNTS_FILE"; then
             # 更新现有账号
-            local encoded_creds=$(echo "$credentials" | base64)
-            # 使用 sed 替换现有条目
-            sed -i '' "s/\"$account_name\": *\"[^\"]*\"/\"$account_name\": \"$encoded_creds\"/" "$ACCOUNTS_FILE"
+            local encoded_creds=$(echo "$credentials" | base64_encode_nolinebreak)
+            # 使用 sed 替换现有条目（跨平台兼容）
+            if [[ "$OS_TYPE" == "macos" ]]; then
+                sed -i '' "s/\"$account_name\": *\"[^\"]*\"/\"$account_name\": \"$encoded_creds\"/" "$ACCOUNTS_FILE"
+            else
+                sed -i "s/\"$account_name\": *\"[^\"]*\"/\"$account_name\": \"$encoded_creds\"/" "$ACCOUNTS_FILE"
+            fi
         else
             # 添加新账号
-            local encoded_creds=$(echo "$credentials" | base64)
+            local encoded_creds=$(echo "$credentials" | base64_encode_nolinebreak)
             # 移除最后的 } (使用 macOS 兼容的命令)
             sed '$d' "$ACCOUNTS_FILE" > "$temp_file"
             # 检查是否需要添加逗号
@@ -537,7 +705,7 @@ switch_account() {
     fi
 
     # 解码凭证
-    local credentials=$(echo "$encoded_creds" | base64 -d)
+    local credentials=$(echo "$encoded_creds" | base64_decode)
 
     # 写入 Keychain
     if write_keychain_credentials "$credentials"; then
@@ -562,30 +730,64 @@ list_accounts() {
     # 读取并解析账号列表
     local current_creds=$(read_keychain_credentials)
 
-    grep --color=never -o '"[^"]*": *"[^"]*"' "$ACCOUNTS_FILE" | while IFS=': ' read -r name encoded; do
-        # 清理引号
-        name=$(echo "$name" | tr -d '"')
-        encoded=$(echo "$encoded" | tr -d '"')
+    # 使用 jq 或 Python 解析 JSON（处理多行 base64 值）
+    if command -v jq >/dev/null 2>&1; then
+        jq -r 'to_entries[] | "\(.key)|\(.value)"' "$ACCOUNTS_FILE" | while IFS='|' read -r name encoded; do
+            # 解码并提取信息
+            local creds=$(echo "$encoded" | base64_decode 2>/dev/null)
+            local subscription=$(echo "$creds" | grep -o '"subscriptionType":"[^"]*"' | cut -d'"' -f4)
+            local expires=$(echo "$creds" | grep -o '"expiresAt":[0-9]*' | cut -d':' -f2)
 
-        # 解码并提取信息
-        local creds=$(echo "$encoded" | base64 -d 2>/dev/null)
-        local subscription=$(echo "$creds" | grep -o '"subscriptionType":"[^"]*"' | cut -d'"' -f4)
-        local expires=$(echo "$creds" | grep -o '"expiresAt":[0-9]*' | cut -d':' -f2)
+            # 检查是否是当前账号
+            local is_current=""
+            if [[ "$creds" == "$current_creds" ]]; then
+                is_current=" ${GREEN}✅ ($(t 'active'))${NC}"
+            fi
 
-        # 检查是否是当前账号
-        local is_current=""
-        if [[ "$creds" == "$current_creds" ]]; then
-            is_current=" ${GREEN}✅ ($(t 'active'))${NC}"
-        fi
+            # 格式化过期时间
+            local expires_str=""
+            if [[ -n "$expires" ]]; then
+                expires_str=$(date -r $((expires / 1000)) "+%Y-%m-%d %H:%M" 2>/dev/null || echo "Unknown")
+            fi
 
-        # 格式化过期时间
-        local expires_str=""
-        if [[ -n "$expires" ]]; then
-            expires_str=$(date -r $((expires / 1000)) "+%Y-%m-%d %H:%M" 2>/dev/null || echo "Unknown")
-        fi
+            echo -e "   - ${YELLOW}$name${NC} (${subscription:-Unknown}${expires_str:+, expires: $expires_str})$is_current"
+        done
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 -c "
+import json
+with open('$ACCOUNTS_FILE') as f:
+    data = json.load(f)
+    for name, encoded in data.items():
+        print(f'{name}|{encoded}')
+" | while IFS='|' read -r name encoded; do
+            # 解码并提取信息
+            local creds=$(echo "$encoded" | base64_decode 2>/dev/null)
+            local subscription=$(echo "$creds" | grep -o '"subscriptionType":"[^"]*"' | cut -d'"' -f4)
+            local expires=$(echo "$creds" | grep -o '"expiresAt":[0-9]*' | cut -d':' -f2)
 
-        echo -e "   - ${YELLOW}$name${NC} (${subscription:-Unknown}${expires_str:+, expires: $expires_str})$is_current"
-    done
+            # 检查是否是当前账号
+            local is_current=""
+            if [[ "$creds" == "$current_creds" ]]; then
+                is_current=" ${GREEN}✅ ($(t 'active'))${NC}"
+            fi
+
+            # 格式化过期时间
+            local expires_str=""
+            if [[ -n "$expires" ]]; then
+                expires_str=$(date -r $((expires / 1000)) "+%Y-%m-%d %H:%M" 2>/dev/null || echo "Unknown")
+            fi
+
+            echo -e "   - ${YELLOW}$name${NC} (${subscription:-Unknown}${expires_str:+, expires: $expires_str})$is_current"
+        done
+    else
+        # 降级方案：仅支持单行 base64 值
+        echo -e "${YELLOW}⚠️  $(t 'install_jq_or_python')${NC}"
+        grep --color=never -o '"[^"]*": *"[^"]*"' "$ACCOUNTS_FILE" | while IFS=': ' read -r name encoded; do
+            name=$(echo "$name" | tr -d '"')
+            encoded=$(echo "$encoded" | tr -d '"')
+            echo -e "   - ${YELLOW}$name${NC}"
+        done
+    fi
 }
 
 # 删除已保存的账号
@@ -613,9 +815,14 @@ delete_account() {
     local temp_file=$(mktemp)
     grep -v "\"$account_name\":" "$ACCOUNTS_FILE" > "$temp_file"
 
-    # 清理可能的逗号问题
-    sed -i '' 's/,\s*}/}/g' "$temp_file" 2>/dev/null || sed -i 's/,\s*}/}/g' "$temp_file"
-    sed -i '' 's/}\s*,/}/g' "$temp_file" 2>/dev/null || sed -i 's/}\s*,/}/g' "$temp_file"
+    # 清理可能的逗号问题（跨平台兼容）
+    if [[ "$OS_TYPE" == "macos" ]]; then
+        sed -i '' 's/,\s*}/}/g' "$temp_file"
+        sed -i '' 's/}\s*,/}/g' "$temp_file"
+    else
+        sed -i 's/,\s*}/}/g' "$temp_file"
+        sed -i 's/}\s*,/}/g' "$temp_file"
+    fi
 
     mv "$temp_file" "$ACCOUNTS_FILE"
     chmod 600 "$ACCOUNTS_FILE"
@@ -650,7 +857,7 @@ get_current_account() {
         while IFS=': ' read -r name encoded; do
             name=$(echo "$name" | tr -d '"')
             encoded=$(echo "$encoded" | tr -d '"')
-            local saved_creds=$(echo "$encoded" | base64 -d 2>/dev/null)
+            local saved_creds=$(echo "$encoded" | base64_decode 2>/dev/null)
             if [[ "$saved_creds" == "$credentials" ]]; then
                 account_name="$name"
                 break
