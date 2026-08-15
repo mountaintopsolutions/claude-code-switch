@@ -173,6 +173,10 @@ CLAUDE_API_KEY=your-claude-api-key
 # OpenRouter
 OPENROUTER_API_KEY=your-openrouter-api-key
 
+# —— Token 自动刷新（可选，取消注释来修改默认行为）——
+# CCM_AUTO_REFRESH=1          # 设为 0 禁用切换账号时的自动刷新
+# CCM_REFRESH_THRESHOLD_MIN=5  # 距过期多少分钟视为"临期"
+
 # —— 可选：模型ID覆盖（不设置则使用下方默认）——
 DEEPSEEK_MODEL=deepseek-chat
 KIMI_MODEL=kimi-k2.5
@@ -282,6 +286,10 @@ CLAUDE_API_KEY=your-claude-api-key
 
 # OpenRouter
 OPENROUTER_API_KEY=your-openrouter-api-key
+
+# —— Token 自动刷新（可选，取消注释来修改默认行为）——
+# CCM_AUTO_REFRESH=1          # 设为 0 禁用切换账号时的自动刷新
+# CCM_REFRESH_THRESHOLD_MIN=5  # 距过期多少分钟视为"临期"
 
 # —— 可选：模型ID覆盖（不设置则使用下方默认）——
 DEEPSEEK_MODEL=deepseek-chat
@@ -1187,6 +1195,279 @@ EOF
     rm -f "$temp_file"
 }
 
+# ============================================
+# Token 自动刷新机制 (via claude CLI)
+# ============================================
+# 设计原则：活跃账号由 claude 使用时自动刷新，ccm 不干预。
+# ccm 仅负责刷新"非活跃的已保存账号"——即 ~/.ccm_accounts 中冻结的快照。
+# 刷新方式：写入 keychain → 运行 claude -p（触发 claude 官方 OAuth 刷新）→ 读回 → 更新快照。
+
+# 当前时间（毫秒）
+now_ms() {
+    echo $(( $(date +%s) * 1000 ))
+}
+
+# 从凭证 JSON 中提取 expiresAt（毫秒），失败返回 0
+credential_expires_at() {
+    local creds="$1"
+    local val
+    val=$(echo "$creds" | grep -o '"expiresAt":[0-9]*' | cut -d':' -f2)
+    echo "${val:-0}"
+}
+
+# 从凭证 JSON 中提取 refreshTokenExpiresAt（毫秒），缺失返回 0
+credential_rt_expires_at() {
+    local creds="$1"
+    local val
+    val=$(echo "$creds" | grep -o '"refreshTokenExpiresAt":[0-9]*' | cut -d':' -f2)
+    echo "${val:-0}"
+}
+
+# 从凭证 JSON 中提取 refreshToken，缺失返回空
+credential_refresh_token() {
+    local creds="$1"
+    echo "$creds" | grep -o '"refreshToken":"[^"]*"' | cut -d'"' -f4
+}
+
+# 判断凭证是否仍然新鲜（未过期且距过期时间 > 阈值）
+# 返回 0 = 新鲜，1 = 临期/已过期
+credential_is_fresh() {
+    local creds="$1"
+    local threshold_min="${2:-${CCM_REFRESH_THRESHOLD_MIN:-5}}"
+    local exp rt_exp now
+    exp=$(credential_expires_at "$creds")
+    now=$(now_ms)
+    if [[ -z "$exp" || "$exp" -eq 0 ]]; then
+        return 1
+    fi
+    local threshold_ms=$(( threshold_min * 60 * 1000 ))
+    if (( exp - now > threshold_ms )); then
+        return 0
+    fi
+    return 1
+}
+
+# 判断 refreshToken 是否仍然有效（未过期）
+# 返回 0 = 可刷新，1 = refresh token 也过期了
+credential_can_refresh() {
+    local creds="$1"
+    local rt rt_exp now
+    rt=$(credential_refresh_token "$creds")
+    if [[ -z "$rt" ]]; then
+        return 1
+    fi
+    rt_exp=$(credential_rt_expires_at "$creds")
+    now=$(now_ms)
+    # 旧版凭证没有 refreshTokenExpiresAt 字段——假设可刷新，让 claude 自己判断
+    if [[ -z "$rt_exp" || "$rt_exp" -eq 0 ]]; then
+        return 0
+    fi
+    if (( rt_exp > now )); then
+        return 0
+    fi
+    return 1
+}
+
+# 通过 claude CLI 刷新当前 keychain 中的活跃凭证
+# 运行一个轻量 haiku 请求触发 claude 内置的 OAuth refresh
+# 返回 0 = 成功，1 = 失败
+refresh_via_claude() {
+    local claude_bin
+    claude_bin=$(command -v claude 2>/dev/null)
+    if [[ -z "$claude_bin" ]]; then
+        echo -e "${YELLOW}⚠️  $(t 'refresh_claude_not_found')${NC}" >&2
+        return 1
+    fi
+
+    # 清除可能存在的 ANTHROPIC_* 环境变量，确保 claude 走原生 OAuth 路径
+    # 而非使用之前 ccm 设置的第三方 provider
+    if ! env -u ANTHROPIC_BASE_URL -u ANTHROPIC_API_URL \
+           -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY \
+           -u ANTHROPIC_MODEL -u ANTHROPIC_SMALL_FAST_MODEL \
+           -u ANTHROPIC_DEFAULT_SONNET_MODEL \
+           -u ANTHROPIC_DEFAULT_OPUS_MODEL \
+           -u ANTHROPIC_DEFAULT_HAIKU_MODEL \
+           -u CLAUDE_CODE_SUBAGENT_MODEL \
+           "$claude_bin" -p 'hi' --model claude-haiku-4-5-20251001 \
+           >/dev/null 2>&1; then
+        echo -e "${YELLOW}⚠️  $(t 'refresh_failed')${NC}" >&2
+        return 1
+    fi
+    return 0
+}
+
+# 更新 ~/.ccm_accounts 中指定账号的 base64 快照
+update_saved_account() {
+    local account_name="$1"
+    local credentials="$2"
+
+    if [[ -z "$account_name" || -z "$credentials" ]]; then
+        return 1
+    fi
+    if [[ ! -f "$ACCOUNTS_FILE" ]]; then
+        return 1
+    fi
+    if ! grep -q "\"$account_name\":" "$ACCOUNTS_FILE"; then
+        return 1
+    fi
+
+    local encoded_creds
+    encoded_creds=$(echo "$credentials" | base64_encode_nolinebreak)
+    if [[ "$OS_TYPE" == "macos" ]]; then
+        sed -i '' "s/\"$account_name\": *\"[^\"]*\"/\"$account_name\": \"$encoded_creds\"/" "$ACCOUNTS_FILE"
+    else
+        sed -i "s/\"$account_name\": *\"[^\"]*\"/\"$account_name\": \"$encoded_creds\"/" "$ACCOUNTS_FILE"
+    fi
+    chmod 600 "$ACCOUNTS_FILE"
+}
+
+# 刷新指定已保存账号的凭证（非活跃账号）
+# 流程：读快照 → 判断是否需要刷新 → 写入 keychain → claude 刷新 → 读回 → 更新快照 → 恢复原活跃账号
+# 参数：account_name  restore_active（非空则恢复原活跃凭证）
+# 返回 0 = 成功/无需刷新，1 = 失败
+maybe_refresh_account() {
+    local account_name="$1"
+    local restore_active="${2:-}"
+
+    # 检查自动刷新是否启用
+    if [[ "${CCM_AUTO_REFRESH:-1}" == "0" ]]; then
+        return 0
+    fi
+
+    if [[ ! -f "$ACCOUNTS_FILE" ]]; then
+        return 0
+    fi
+
+    # 读取账号快照
+    local encoded_creds
+    encoded_creds=$(grep -o "\"$account_name\": *\"[^\"]*\"" "$ACCOUNTS_FILE" | cut -d'"' -f4)
+    if [[ -z "$encoded_creds" ]]; then
+        return 0
+    fi
+
+    local credentials
+    credentials=$(echo "$encoded_creds" | base64_decode)
+
+    # 如果仍然新鲜，无需刷新
+    if credential_is_fresh "$credentials"; then
+        return 0
+    fi
+
+    echo -e "${BLUE}🔄 $(t 'refreshing_account'): $account_name${NC}" >&2
+
+    # 检查 refreshToken 是否有效
+    if ! credential_can_refresh "$credentials"; then
+        echo -e "${RED}❌ $(t 'refresh_token_expired')${NC}" >&2
+        echo -e "${YELLOW}💡 $(t 'refresh_relogin_hint')${NC}" >&2
+        return 1
+    fi
+
+    # 保存当前活跃凭证（用于后续恢复）
+    local active_creds=""
+    if [[ -n "$restore_active" ]]; then
+        active_creds=$(read_keychain_credentials)
+    fi
+
+    # 写入目标账号到 keychain（使其成为"活跃"）
+    write_keychain_credentials "$credentials" >/dev/null 2>&1
+
+    # 通过 claude 刷新
+    if ! refresh_via_claude; then
+        # 刷新失败——恢复原活跃账号
+        if [[ -n "$restore_active" && -n "$active_creds" ]]; then
+            write_keychain_credentials "$active_creds" >/dev/null 2>&1
+        fi
+        return 1
+    fi
+
+    # 读回刷新后的凭证
+    local refreshed_creds
+    refreshed_creds=$(read_keychain_credentials)
+    if [[ -z "$refreshed_creds" ]]; then
+        if [[ -n "$restore_active" && -n "$active_creds" ]]; then
+            write_keychain_credentials "$active_creds" >/dev/null 2>&1
+        fi
+        return 1
+    fi
+
+    # 更新 ~/.ccm_accounts 中的快照
+    update_saved_account "$account_name" "$refreshed_creds"
+
+    # 恢复原活跃账号
+    if [[ -n "$restore_active" && -n "$active_creds" ]]; then
+        write_keychain_credentials "$active_creds" >/dev/null 2>&1
+    fi
+
+    echo -e "${GREEN}✅ $(t 'account_refreshed'): $account_name${NC}" >&2
+    return 0
+}
+
+# 刷新所有已保存账号（跳过当前活跃账号——它由 claude 使用时自动刷新）
+refresh_all_accounts() {
+    if [[ ! -f "$ACCOUNTS_FILE" ]]; then
+        echo -e "${YELLOW}$(t 'no_accounts_saved')${NC}" >&2
+        return 0
+    fi
+
+    local current_creds
+    current_creds=$(read_keychain_credentials)
+
+    local refreshed=0
+    local skipped=0
+    local failed=0
+
+    # 遍历所有已保存账号
+    local account_names=()
+    if command -v jq >/dev/null 2>&1; then
+        while IFS= read -r name; do
+            account_names+=("$name")
+        done < <(jq -r 'keys[]' "$ACCOUNTS_FILE" 2>/dev/null)
+    elif command -v python3 >/dev/null 2>&1; then
+        while IFS= read -r name; do
+            account_names+=("$name")
+        done < <(python3 -c "import json; print('\n'.join(json.load(open('$ACCOUNTS_FILE')).keys()))" 2>/dev/null)
+    else
+        while IFS=': ' read -r name _; do
+            name=$(echo "$name" | tr -d '"' | tr -d ' ')
+            [[ -n "$name" ]] && account_names+=("$name")
+        done < <(grep --color=never -o '"[^"]*": *"[^"]*"' "$ACCOUNTS_FILE")
+    fi
+
+    for name in "${account_names[@]}"; do
+        # 读取该账号的凭证
+        local encoded
+        encoded=$(grep -o "\"$name\": *\"[^\"]*\"" "$ACCOUNTS_FILE" | cut -d'"' -f4)
+        local creds
+        creds=$(echo "$encoded" | base64_decode 2>/dev/null)
+
+        # 跳过当前活跃账号（claude 使用时已自动刷新）
+        if [[ -n "$current_creds" && "$creds" == "$current_creds" ]]; then
+            ((skipped++))
+            continue
+        fi
+
+        # 跳过仍然新鲜的账号
+        if credential_is_fresh "$creds"; then
+            ((skipped++))
+            continue
+        fi
+
+        # 刷新（恢复原活跃账号）
+        if maybe_refresh_account "$name" "restore"; then
+            ((refreshed++))
+        else
+            ((failed++))
+        fi
+    done
+
+    echo "" >&2
+    echo -e "${BLUE}📊 $(t 'refresh_summary'): ${NC}" >&2
+    echo "   $(t 'refresh_refreshed'): $refreshed" >&2
+    echo "   $(t 'refresh_skipped'): $skipped" >&2
+    [[ $failed -gt 0 ]] && echo -e "   ${RED}$(t 'refresh_failed_count'): $failed${NC}" >&2
+    return 0
+}
+
 # 切换到指定账号
 switch_account() {
     # 检查是否需要禁用颜色（用于 eval）
@@ -1219,14 +1500,35 @@ switch_account() {
     # 解码凭证
     local credentials=$(echo "$encoded_creds" | base64_decode)
 
-    # 写入 Keychain
-    if write_keychain_credentials "$credentials"; then
-        echo -e "${GREEN}✅ $(t 'account_switched'): $account_name${NC}"
-        echo -e "${YELLOW}⚠️  $(t 'please_restart_claude_code')${NC}"
-    else
+    # 写入 Keychain（使其成为活跃账号）
+    if ! write_keychain_credentials "$credentials"; then
         echo -e "${RED}❌ $(t 'failed_to_switch_account')${NC}" >&2
         return 1
     fi
+
+    # 如果凭证临期/过期，通过 claude 刷新并更新快照
+    # （活跃账号由 claude 使用时自动刷新，这里仅处理切换瞬间凭证已过期的情况）
+    if [[ "${CCM_AUTO_REFRESH:-1}" != "0" ]] && ! credential_is_fresh "$credentials"; then
+        if credential_can_refresh "$credentials"; then
+            echo -e "${BLUE}🔄 $(t 'refreshing_account'): $account_name${NC}" >&2
+            if refresh_via_claude; then
+                # 读回刷新后的凭证
+                local refreshed_creds
+                refreshed_creds=$(read_keychain_credentials)
+                if [[ -n "$refreshed_creds" ]]; then
+                    update_saved_account "$account_name" "$refreshed_creds"
+                fi
+            else
+                echo -e "${YELLOW}⚠️  $(t 'refresh_failed_continue')${NC}" >&2
+            fi
+        else
+            echo -e "${YELLOW}⚠️  $(t 'refresh_token_expired')${NC}" >&2
+            echo -e "${YELLOW}💡 $(t 'refresh_relogin_hint')${NC}" >&2
+        fi
+    fi
+
+    echo -e "${GREEN}✅ $(t 'account_switched'): $account_name${NC}"
+    echo -e "${YELLOW}⚠️  $(t 'please_restart_claude_code')${NC}"
 }
 
 # 列出所有已保存的账号
@@ -1787,10 +2089,11 @@ show_help() {
     echo ""
     echo -e "${YELLOW}Claude Pro Account Management:${NC}"
     echo "  save-account <name>     - Save current Claude Pro account"
-    echo "  switch-account <name>   - Switch to saved account"
+    echo "  switch-account <name>   - Switch to saved account (auto-refreshes if stale)"
     echo "  list-accounts           - List all saved accounts"
     echo "  delete-account <name>   - Delete saved account"
     echo "  current-account         - Show current account info"
+    echo "  refresh [--all|<name>]  - Refresh stale saved account tokens (skips active)"
     echo "  claude:account         - Switch account and use Claude (Sonnet)"
     echo ""
     echo -e "${YELLOW}$(t 'tool_options'):${NC}"
@@ -2333,6 +2636,14 @@ main() {
             ;;
         "debug-keychain")
             debug_keychain_credentials
+            ;;
+        "refresh")
+            local refresh_target="${2:-}"
+            if [[ -z "$refresh_target" || "$refresh_target" == "--all" || "$refresh_target" == "-a" ]]; then
+                refresh_all_accounts
+            else
+                maybe_refresh_account "$refresh_target" "restore"
+            fi
             ;;
         # 模型切换命令
         "deepseek"|"ds")

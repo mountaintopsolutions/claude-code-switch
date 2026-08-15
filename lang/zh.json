@@ -113,5 +113,16 @@
   "openrouter_provider_qwen": "Qwen (通过 OpenRouter)",
   "openrouter_provider_stepfun": "StepFun (通过 OpenRouter)",
   "openrouter_provider_claude": "Claude (通过 OpenRouter)",
-  "openrouter_provider_unknown": "未知 (模型:"
+  "openrouter_provider_unknown": "未知 (模型:",
+  "refreshing_account": "正在刷新账号令牌",
+  "account_refreshed": "账号令牌已刷新",
+  "refresh_token_expired": "刷新令牌已过期",
+  "refresh_relogin_hint": "请运行 'claude auth login' 后 'ccm save-account <名称>' 重新保存",
+  "refresh_failed": "通过 claude CLI 刷新令牌失败",
+  "refresh_failed_continue": "刷新失败，继续使用当前令牌",
+  "refresh_claude_not_found": "未找到 claude CLI，无法刷新令牌",
+  "refresh_summary": "刷新摘要",
+  "refresh_refreshed": "已刷新",
+  "refresh_skipped": "已跳过（新鲜或活跃）",
+  "refresh_failed_count": "失败"
 }
