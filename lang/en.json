@@ -113,5 +113,16 @@
   "openrouter_provider_qwen": "Qwen (via OpenRouter)",
   "openrouter_provider_stepfun": "StepFun (via OpenRouter)",
   "openrouter_provider_claude": "Claude (via OpenRouter)",
-  "openrouter_provider_unknown": "Unknown (model:"
+  "openrouter_provider_unknown": "Unknown (model:",
+  "refreshing_account": "Refreshing account token",
+  "account_refreshed": "Account token refreshed",
+  "refresh_token_expired": "Refresh token has expired",
+  "refresh_relogin_hint": "Run 'claude auth login' then 'ccm save-account <name>' to re-save",
+  "refresh_failed": "Token refresh via claude CLI failed",
+  "refresh_failed_continue": "Refresh failed, continuing with current token",
+  "refresh_claude_not_found": "claude CLI not found, cannot refresh token",
+  "refresh_summary": "Refresh summary",
+  "refresh_refreshed": "Refreshed",
+  "refresh_skipped": "Skipped (fresh or active)",
+  "refresh_failed_count": "Failed"
 }
